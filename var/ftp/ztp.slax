@@ -1,0 +1,206 @@
+version 1.0;
+
+/* Junos standard namespaces */
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+
+/* EXSLT extensions and app specific namespaces */
+ns exsl extension = "http://exslt.org/common";
+ns func extension = "http://exslt.org/functions";
+ns ztp = "http://xml.juniper.net/junos/ztp";
+
+import "/var/run/scripts/import/junos.xsl";
+
+var $CONFIG-PREFIX = "JUNOS-";
+var $REGISTER-PREFIX = "REGISTER-";
+
+var $TMP-DIR = "/tmp/";
+var $CONFIG-DIR = "ftp://10.207.0.1/configs/";
+
+var $EVENT-POLICY = "ztp-autoi";             /* as defined in network.conf file */
+var $SYSLOG_TAG = "ztp-config: ";
+var $SYSLOG = "external.notice";
+
+/* !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ * !!!!!                      MAIN ENTRY                        !!!!!
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! */
+
+match / {
+    <op-script-results> {
+
+
+   /* open connection to Junos management for XML/API processing */
+
+   var $jnx = jcs:open();
+
+   var $inv = jcs:execute( $jnx, 'get-chassis-inventory' );
+   var $hw-model = $inv/chassis/description;
+   var $hw-snum = $inv/chassis/serial-number;
+   var $temp2 = jcs:output($hw-snum);
+   call ztp:load-serial-number-config( $jnx, $ztp-step = 1, $hw-snum );
+
+   expr jcs:close( $jnx );
+   }
+}
+
+/* -----------------------------------------------------------------------
+   TEMPLATE: ztp:load-serial-number-config
+   -----------------------------------------------------------------------
+   this template is called from "main" when the LLDP neighbor is
+   established on $interface.
+   ----------------------------------------------------------------------- */
+
+template ztp:load-serial-number-config( $jnx, $ztp-step, $hw-snum )
+{
+
+    var $syslog_step = "[" _ $ztp-step _ "] ";
+   /* ------------------------------------------------------- */
+   /* formulate the device network-location specific filename */
+   /* ------------------------------------------------------- */
+   var $config-file = $hw-snum _ ".conf";
+
+   /* ------------------------------------------------ */
+   /* copy the configuration file from the FTP $server */
+   /* ------------------------------------------------ */
+
+   var $src-file = $CONFIG-DIR _ $config-file;
+   var $dst-file = $TMP-DIR _ $config-file;
+
+
+   expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, $syslog_step, "retrieving file ", $src-file );
+
+   var $cpy-cmd = <file-copy> { <source> $src-file; <destination> $dst-file; }
+
+   var $cpy-rsp = jcs:execute( $jnx, $cpy-cmd );
+   if( $cpy-rsp//self::xnm:error ) {
+      var $header = $syslog_step _ "ERROR: unable to copy file: " _ $src-file;
+      call syslog-messages( $header, $messages = $cpy-rsp//self::xnm:error/message );
+   }
+   else {
+
+      /* --------------------------------------------  */
+      /* now retrieve the contents of the file since   */
+      /* we're going to add to this as part of the     */
+      /* ZTP configuration change                      */
+      /* --------------------------------------------- */
+
+      var $get-cmd = <file-get> { <encoding> "ascii"; <filename> $dst-file; }
+      var $get-rsp = jcs:execute( $jnx, $get-cmd );
+      if( $get-rsp/file-contents ) {
+
+         /* ---------------- */
+         /*  GOTO NEXT STEP  */
+         /* ---------------- */
+
+         call ztp:on-config-file( $jnx, $ztp-step = $ztp-step+1, $file-contents = $get-rsp/file-contents );
+      }
+      else {
+         expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, $syslog_step, "ERROR: file ", $dst-file, " has no contents." );
+      }
+   }
+}
+
+/* -----------------------------------------------------------------------
+   TEMPLATE: ztp:on-config-file
+   -----------------------------------------------------------------------
+   this template is called once the device specific configuration file
+   has been downloaded from the $server and the contents are made
+   available for processing.
+   ----------------------------------------------------------------------- */
+
+template ztp:on-config-file( $jnx, $ztp-step, $file-contents )
+{
+   var $syslog_step = "[" _ $ztp-step _ "] ";
+
+   /* could do something intelligent here to look at contents to see if it's a
+      text load, xml load, or set load ... for now, just assuming text load */
+
+   var $load-cmd = <load-configuration format="text" action="replace"> { <configuration-text> {
+      copy-of string( $file-contents );
+
+      /* remove the ZTP event trigger that was part of network.conf */
+      expr "event-options { ";
+      expr    "delete: policy " _ $EVENT-POLICY _ ";";
+      expr    "generate-event { delete: " _ $EVENT-POLICY _ "; }";
+      expr "}";
+
+   }}
+
+   var $load = ztp:load-config( $jnx, $load-cmd );
+
+   if(not( $load/message )) {
+
+      /* ---------------- */
+      /*  GOTO NEXT STEP  */
+      /* ---------------- */
+
+      expr jcs:syslog( $SYSLOG, $SYSLOG_TAG, $syslog_step, "loaded config OK" );
+   }
+}
+
+
+
+/* !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ * !!!!!            "Helper" Functions/Templates                !!!!!
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! */
+
+<func:function name="ztp:ping">
+{
+   param $jnx;
+   param $_host_;
+   param $_source_;
+
+   var $cmd = <ping> { <host> $_host_;
+      <no-resolve>;
+      <source> $_source_;
+      <count> 1;
+   }
+
+   var $rsp = jcs:execute( $jnx, $cmd );
+
+   <func:result select="exsl:node-set($rsp)">;
+}
+
+<func:function name="ztp:junos-version">
+{
+   param $jnx;
+
+   var $cmd = <get-configuration> { <configuration> { <version>; }}
+   var $ver = jcs:execute( $jnx, $cmd )//version;
+
+   <func:result select="string($ver)">;
+}
+
+/* this function is used to load/commit changes to the configuration; no locking */
+
+<func:function name="ztp:load-config">
+{
+   param $jnx;
+   param $load-cmd;
+
+   var $load-rsp = jcs:execute( $jnx, $load-cmd );
+   if( $load-rsp//self::xnm:error ) {
+      call syslog-messages( $header = "unable to load configuration", $messages = $load-rsp//self::xnm:error/message );
+      <func:result select="$load-rsp//self::xnm:error">;
+   }
+   else {
+      var $commit-rsp = jcs:execute( $jnx, "commit-configuration" );
+      if( $commit-rsp//self::xnm:error ) {
+         call syslog-messages( $header = "unable to commit configuration", $messages = $commit-rsp//self::xnm:error/message );
+         <func:result select="exsl:node-set($commit-rsp//self::xnm:error)">;
+      }
+      else {
+         <func:result select="/null">;
+      }
+   }
+}
+
+/* this template is used to dump warning/error messages to syslog */
+
+template syslog-messages( $header, $messages )
+{
+   for-each( $messages ) {
+      expr jcs:output($header _ $messages);
+   }
+}
